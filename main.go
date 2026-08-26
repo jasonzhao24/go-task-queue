@@ -52,6 +52,30 @@ func (q *MemoryQueue) Enqueue(payload []byte) string {
 
 	return id
 }
+
+func (q *MemoryQueue) Dequeue(workerID string) *Task {
+	q.mu.Lock()
+	defer q.mu.Unlock() // same as enqueue func
+
+	for _, task := range q.tasks {
+		if task.State == Available {
+			task.State = Leased      // Mark as leased so no worker is able to take it
+			task.WorkerID = workerID // Keep track of which worker claimed it
+			task.VisibleAt = time.Now().Add(5 * time.Second)
+			return task
+		}
+	}
+	return nil
+}
+
+func (q *MemoryQueue) Acknowledge(taskID string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	// Deletes key from the map and removes successfully completed task from queue
+	delete(q.tasks, taskID)
+}
+
 func main() {
 
 }
