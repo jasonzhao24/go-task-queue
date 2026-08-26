@@ -91,28 +91,5 @@ func (q *MemoryQueue) StartReaper() {
 		q.mu.Unlock()
 	}
 }
-func main() { // Testing Functions
-	
-	queue := NewMemoryQueue()
-
-	// The 'go' keyword spins this function off into a lightweight background thread
-	go queue.StartReaper()
-
-	// 1. Enqueue
-	taskID := queue.Enqueue([]byte("process_payment_123"))
-	fmt.Printf("Enqueued: %s\n", taskID)
-
-	// 2. Worker-A leases the task but CRASHES (never calls Acknowledge)
-	task1 := queue.Dequeue("worker-A")
-	fmt.Printf("Worker-A leased task: %s\n", task1.ID)
-	fmt.Println("Worker-A crashed! Waiting for Reaper to step in...")
-
-	// 3. Wait for 6 seconds (our Dequeue timeout was 5 seconds)
-	time.Sleep(6 * time.Second)
-
-	// 4. Worker-B checks the queue
-	task2 := queue.Dequeue("worker-B")
-	if task2 != nil {
-		fmt.Printf("Worker-B successfully leased the recovered task: %s\n", task2.ID)
-	}
+func main() { 
 }

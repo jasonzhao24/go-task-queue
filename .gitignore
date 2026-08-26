@@ -3,3 +3,6 @@ taskqueue
 
 # Environment variables
 .env
+
+# DynamoDB Local Data
+/data
