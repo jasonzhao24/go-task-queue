@@ -91,7 +91,8 @@ func (q *MemoryQueue) StartReaper() {
 		q.mu.Unlock()
 	}
 }
-func main() {
+func main() { // Testing Functions
+	
 	queue := NewMemoryQueue()
 
 	// The 'go' keyword spins this function off into a lightweight background thread
