@@ -168,3 +168,19 @@ func (q *DynamoQueue) CreateTable(ctx context.Context) error {
 
 	return err
 }
+
+func (q *DynamoQueue) Acknowledge(ctx context.Context, taskID string) error {
+	_, err := q.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: aws.String(q.tableName),
+		// Get ID to delete row in DynamoDB table
+		Key: map[string]types.AttributeValue{
+			"ID": &types.AttributeValueMemberS{Value: taskID},
+		},
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to delete task %s: %v", taskID, err)
+	}
+
+	return nil
+}
