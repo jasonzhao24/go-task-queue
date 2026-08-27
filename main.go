@@ -20,6 +20,7 @@ type Task struct {
 	WorkerID   string
 	VisibleAt  time.Time
 	RetryCount int
+	CreatedAt  int64
 }
 
 type MemoryQueue struct {
@@ -91,5 +92,6 @@ func (q *MemoryQueue) StartReaper() {
 		q.mu.Unlock()
 	}
 }
-func main() { 
+func main() {
+
 }
