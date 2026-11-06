@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -29,7 +30,11 @@ func NewDynamoQueue(ctx context.Context, tableName string) (*DynamoQueue, error)
 	}
 	// DynamoDB client
 	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
-		o.BaseEndpoint = aws.String("http://localhost:8000")
+		endpoint := os.Getenv("DYNAMODB_ENDPOINT")
+		if endpoint == "" {
+			endpoint = "http://dynamodb-local:8000" // Use the Docker Compose service name
+		}
+		o.BaseEndpoint = aws.String(endpoint)
 	})
 
 	return &DynamoQueue{
@@ -69,7 +74,6 @@ func (q *DynamoQueue) Enqueue(ctx context.Context, payload []byte) (string, erro
 	return id, nil
 }
 
-// Dequeue to find oldest available task and to lease it
 func (q *DynamoQueue) Dequeue(ctx context.Context, workerID string) (*Task, error) {
 	queryOut, err := q.client.Query(ctx, &dynamodb.QueryInput{
 		TableName:              aws.String(q.tableName),
@@ -79,56 +83,61 @@ func (q *DynamoQueue) Dequeue(ctx context.Context, workerID string) (*Task, erro
 			"#state": "State",
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":availableState": &types.AttributeValueMemberN{Value: "0"}, // Value 0 is our Available State
+			":availableState": &types.AttributeValueMemberN{Value: "0"},
 		},
-		Limit: aws.Int32(1), // Oldest task
+		Limit: aws.Int32(5),
 	})
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to query GSI: %v", err)
 	}
-	// empty queue
+
 	if len(queryOut.Items) == 0 {
-		return nil, nil
+		return nil, nil // Queue is completely empty
 	}
 
-	var task Task
-	if err := attributevalue.UnmarshalMap(queryOut.Items[0], &task); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal task: %v", err)
+	// iterate through batgch for tasks
+	for _, item := range queryOut.Items {
+		var task Task
+		if err := attributevalue.UnmarshalMap(item, &task); err != nil {
+			continue
+		}
+
+		visibleAt := time.Now().Add(5 * time.Second)
+		updateOut, err := q.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName: aws.String(q.tableName),
+			Key: map[string]types.AttributeValue{
+				"ID": &types.AttributeValueMemberS{Value: task.ID},
+			},
+			UpdateExpression:    aws.String("SET #state = :leasedState, WorkerID = :worker, VisibleAt = :visible"),
+			ConditionExpression: aws.String("#state = :availableState"),
+			ExpressionAttributeNames: map[string]string{
+				"#state": "State",
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":leasedState":    &types.AttributeValueMemberN{Value: "1"},
+				":worker":         &types.AttributeValueMemberS{Value: workerID},
+				":visible":        &types.AttributeValueMemberS{Value: visibleAt.Format(time.RFC3339Nano)},
+				":availableState": &types.AttributeValueMemberN{Value: "0"},
+			},
+			ReturnValues: types.ReturnValueAllNew,
+		})
+
+		if err != nil {
+			// find another task
+			continue
+		}
+
+		var updatedTask Task
+		if err := attributevalue.UnmarshalMap(updateOut.Attributes, &updatedTask); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal updated task: %v", err)
+		}
+
+		return &updatedTask, nil
 	}
 
-	visibleAt := time.Now().Add(5 * time.Second)
-	updateOut, err := q.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(q.tableName),
-		Key: map[string]types.AttributeValue{
-			"ID": &types.AttributeValueMemberS{Value: task.ID},
-		},
-		// State to leased, assign the task to the ID, and set the timeout
-		UpdateExpression: aws.String("SET #state = :leasedState, WorkerID = :worker, VisibleAt = :visible"),
-		// Only works if the state is available
-		ConditionExpression: aws.String("#state = :availableState"),
-		ExpressionAttributeNames: map[string]string{
-			"#state": "State",
-		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":leasedState":    &types.AttributeValueMemberN{Value: "1"},
-			":worker":         &types.AttributeValueMemberS{Value: workerID},
-			":visible":        &types.AttributeValueMemberS{Value: visibleAt.Format(time.RFC3339Nano)},
-			":availableState": &types.AttributeValueMemberN{Value: "0"},
-		},
-		ReturnValues: types.ReturnValueAllNew,
-	})
-	if err != nil {
-		// task taken
-		return nil, nil
-	}
-	// return leased task
-	var updatedTask Task
-	if err := attributevalue.UnmarshalMap(updateOut.Attributes, &updatedTask); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal updated task: %v", err)
-	}
-
-	return &updatedTask, nil
+	// No available tasks
+	return nil, nil
 }
 
 // Create DynamoDB table
@@ -183,4 +192,63 @@ func (q *DynamoQueue) Acknowledge(ctx context.Context, taskID string) error {
 	}
 
 	return nil
+}
+
+// Scans for expired leases and resets them
+func (q *DynamoQueue) StartReaper(ctx context.Context) {
+	for {
+		time.Sleep(2 * time.Second)
+
+		out, err := q.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String(q.tableName),
+			IndexName:              aws.String("State-CreatedAt-Index"),
+			KeyConditionExpression: aws.String("#state = :leasedState"),
+			ExpressionAttributeNames: map[string]string{
+				"#state": "State",
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":leasedState": &types.AttributeValueMemberN{Value: "1"}, // 1 = Leased
+			},
+		})
+
+		if err != nil {
+			fmt.Printf("[Reaper] Error querying GSI: %v\n", err)
+			continue
+		}
+
+		now := time.Now()
+
+		// 2. Check if expired
+		for _, item := range out.Items {
+			var task Task
+			if err := attributevalue.UnmarshalMap(item, &task); err != nil {
+				continue
+			}
+
+			if now.After(task.VisibleAt) {
+				_, err := q.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+					TableName: aws.String(q.tableName),
+					Key: map[string]types.AttributeValue{
+						"ID": &types.AttributeValueMemberS{Value: task.ID},
+					},
+					UpdateExpression: aws.String("SET #state = :availableState, WorkerID = :emptyWorker, RetryCount = RetryCount + :inc"),
+
+					ConditionExpression: aws.String("#state = :leasedState"),
+					ExpressionAttributeNames: map[string]string{
+						"#state": "State",
+					},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":availableState": &types.AttributeValueMemberN{Value: "0"},
+						":emptyWorker":    &types.AttributeValueMemberS{Value: ""},
+						":inc":            &types.AttributeValueMemberN{Value: "1"},
+						":leasedState":    &types.AttributeValueMemberN{Value: "1"},
+					},
+				})
+
+				if err == nil {
+					fmt.Printf("[Reaper] Lease expired for task %s. Resetting to Available. (Retries: %d)\n", task.ID, task.RetryCount+1)
+				}
+			}
+		}
+	}
 }
