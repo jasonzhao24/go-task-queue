@@ -7,32 +7,12 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"time"
+
+	"taskqueue/queue"
 )
-
-type TaskState int
-
-const (
-	Available TaskState = iota
-	Leased
-)
-
-type Task struct {
-	ID         string
-	Payload    []byte
-	State      TaskState
-	WorkerID   string
-	VisibleAt  time.Time
-	RetryCount int
-	CreatedAt  int64
-}
 
 type EnqueueRequest struct {
 	Payload string `json:"payload"`
-}
-
-type DequeueRequest struct {
-	WorkerID string `json:"worker_id"`
 }
 
 type AcknowledgeRequest struct {
@@ -42,14 +22,11 @@ type AcknowledgeRequest struct {
 func main() {
 	ctx := context.Background()
 
-	// Initialize the DynamoDB Queue
-	queue, err := NewDynamoQueue(ctx, "Tasks")
+	// Use the queue package prefix here:
+	q, err := queue.NewRedisQueue(ctx, "redis:6379")
 	if err != nil {
-		log.Fatalf("Failed to initialize DynamoDB client: %v", err)
+		log.Fatalf("Failed to initialize Redis client: %v", err)
 	}
-
-	queue.CreateTable(ctx)
-	go queue.StartReaper(ctx)
 
 	http.HandleFunc("/enqueue", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -60,14 +37,14 @@ func main() {
 		body, _ := io.ReadAll(r.Body)
 		json.Unmarshal(body, &req)
 
-		id, err := queue.Enqueue(ctx, []byte(req.Payload))
+		task, err := q.Enqueue(ctx, []byte(req.Payload))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"task_id": id})
+		json.NewEncoder(w).Encode(map[string]string{"task_id": task.ID})
 	})
 
 	http.HandleFunc("/dequeue", func(w http.ResponseWriter, r *http.Request) {
@@ -81,7 +58,7 @@ func main() {
 			return
 		}
 
-		task, err := queue.Dequeue(ctx, workerID)
+		task, err := q.Dequeue(ctx, workerID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -104,7 +81,7 @@ func main() {
 		body, _ := io.ReadAll(r.Body)
 		json.Unmarshal(body, &req)
 
-		err := queue.Acknowledge(ctx, req.TaskID)
+		err := q.Acknowledge(ctx, req.TaskID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
